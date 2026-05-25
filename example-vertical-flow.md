@@ -617,6 +617,112 @@ MercadoLibre publish:
   ml_publish_item_<productId>_<draftVersion>
 ```
 
+## Migrar un caller IA existente al control plane
+
+Cuando hay codigo legacy que llama el SDK del provider (Groq, OpenAI, axios)
+directo, la migracion sigue tres patrones segun la complejidad del caller.
+
+Lo importante es no romper comportamiento: tests de regresion ANTES de migrar.
+
+### Patron 1 — Single-shot sin tools
+
+Cuando el caller pide una sola respuesta JSON o texto: extraer datos,
+clasificar intent, draftear un mensaje, generar contenido.
+
+```txt
+Caller legacy (anti-patron):
+  const client = new ProviderSDK({ apiKey: process.env.PROVIDER_KEY });
+  const completion = await client.chat.completions.create({...});
+  const text = completion.choices[0].message.content;
+
+Migracion correcta:
+  const result = await aiGateway.chatJson({
+    clientId, feature, sourceModule, sourceType, sourceId,
+    systemPrompt, userInput,
+    riskLevel: 'low' | 'medium' | 'high',
+    jsonSchema: STRICT_SCHEMA,   // estructura garantizada a nivel de tokens
+    promptVersion, schemaVersion,
+    disableCache: true,           // si la respuesta es conversacional o unica
+  });
+  if (result.error) { /* fallback aplicable al dominio */ }
+  return result.output;
+
+Lo que sale gratis (sin escribir codigo):
+  - providerSelector elige modelo por feature/riesgo/plan.
+  - circuit breaker salta provider caido.
+  - fallback a un segundo proveedor (si el primario falla).
+  - AiUsageEvent automatico (analytics granular).
+  - structured outputs strict (si pasas jsonSchema).
+  - provider preferences price-first cuando el candidato es tier 'cheap'.
+```
+
+### Patron 2 — Loop con tool calling
+
+Cuando el caller necesita un loop iterativo donde el LLM puede invocar
+funciones (asistente conversacional, bot que consulta tools).
+
+```txt
+Por que NO sirve un entry point single-shot:
+  - El loop necesita messages[] con history + tool_calls + tool_results
+    intercalados, no un userInput plano.
+  - Los tool_call_id no son portables entre providers.
+    Si el provider A devuelve tc_abc y al fallar pasas el array de messages
+    al provider B, B no reconoce ese ID. El loop se rompe.
+
+Patron correcto:
+  - El loop vive local en el caller.
+  - Reusa providerSelector + circuit breaker + usage ledger como librerias
+    (no llama al entry point single-shot).
+  - El fallback se hace al INICIO de cada iteracion (cuando todavia no
+    hay tool_call_ids comprometidos), no DENTRO de ella.
+  - Cada iteracion genera un AiUsageEvent separado con
+    requestId = `<caller>_<sessionId>_iter<N>`.
+```
+
+### Patron 3 — Decision con state machine
+
+Cuando la salida de la IA tiene que afectar una accion sensible (envio
+masivo, publicacion externa, respuesta a un cliente).
+
+```txt
+No usar el entry point single-shot — usar el Decision Engine.
+
+  const decision = await routingDecision.service.decide(snapshot);
+  // -> Policy + Cache + Selector + AI + Schema + Business + Approval
+  // -> persiste RouterDecision con state machine
+  // -> el executor no avanza hasta que la decision sea routable
+```
+
+### Tests de regresion antes de migrar
+
+Patron probado en migraciones reales:
+
+```txt
+1. Identificar los comportamientos criticos del caller actual:
+   - happy path
+   - fallback / degradacion
+   - limites del plan (si aplica)
+   - errores recuperables vs throw
+   - branches del control flow (con/sin tools, etc.)
+
+2. Escribir tests que mockeen las dependencias externas (HTTP, SDK)
+   y validen los comportamientos observables.
+
+3. Correr los tests CONTRA EL CODIGO ACTUAL. Verde antes de tocar.
+
+4. Migrar. Actualizar los mocks (cambian los puntos de inspeccion,
+   no los comportamientos esperados).
+
+5. Correr los tests CONTRA EL CODIGO NUEVO. Verde despues de migrar
+   = cero regresiones de comportamiento.
+
+6. Borrar el codigo legacy.
+```
+
+Los tests son tests de COMPORTAMIENTO, no de implementacion. Migrar de
+`providerSDK.chat.completions.create` a `aiGateway.chatJson` cambia los puntos
+de mock — el contrato observable del caller no cambia.
+
 ## Definition of Done vertical
 
 Una feature vertical esta completa cuando:
