@@ -432,7 +432,7 @@ Responsabilidad del Provider Outbound Gateway:
 
 ```txt
 resolver ProviderAccount
-obtener access token fresco
+obtener access token fresco (con lease anti-concurrente para refresh)
 aplicar idempotency key
 aplicar circuit breaker
 aplicar rate limit
@@ -441,6 +441,33 @@ persistir ProviderHttpAttempt
 registrar costo si aplica
 devolver resultado uniforme
 ```
+
+### Lease anti-concurrente para refresh de tokens
+
+`providerAccount.getValidToken` aplica un lease distribuido (en MongoDB o
+Redis) antes de invocar al refresher OAuth.
+
+Por que importa: sin lease, dos workers que detectan token vencido en
+paralelo llaman al refresher al mismo tiempo. Providers que rotan el
+refreshToken (OAuth standard) invalidan el refreshToken del primer call
+cuando aceptan el segundo → la cuenta queda con tokens invalidos.
+
+Patron:
+
+```txt
+worker A intenta claim atomico del lock (findOneAndUpdate con $or de
+  {lockedBy:null} o {lockExpiresAt:<now})
+  -> A gana: llama refresher, persiste tokens, libera lock
+  -> B pierde: pollea cada 250ms hasta que A libere (o lock expire en 30s),
+               luego re-lee tokens frescos desde BD sin llamar al refresher
+```
+
+El lock tiene TTL (30s recomendado). Si el worker que lo tomo se cae
+mid-refresh, otro worker puede reclamarlo cuando expira (recovery
+automatico, sin intervencion manual).
+
+Regla: ningun caller llama al refresher OAuth manualmente. Toda renovacion
+de token pasa por `getValidToken`.
 
 Errores esperados:
 
@@ -722,6 +749,32 @@ Patron probado en migraciones reales:
 Los tests son tests de COMPORTAMIENTO, no de implementacion. Migrar de
 `providerSDK.chat.completions.create` a `aiGateway.chatJson` cambia los puntos
 de mock — el contrato observable del caller no cambia.
+
+### Helpers reutilizables para tests de providers
+
+Cuando empezas a sumar APIs externas los mocks se repiten. Conviene
+centralizar fixtures en un archivo aparte (ej. `tests/_fixtures/providers.js`)
+con prefijo `_` para excluirlo del `testMatch` del runner.
+
+Helpers tipicos que reducen ~30% del codigo de cada test:
+
+```txt
+IDS                          ObjectIds canonicos (CLIENT, ACCOUNT, EVENT, ...)
+makeProviderAccount({...})   stub de ProviderAccount con .save() y campos del lease
+makeManifest({...})          manifest stub con retry corto para tests rapidos
+callParams({...})            params canonicos para el gateway
+mockGetValidToken({...})     mock con el shape estandar { accessToken, account, refreshed }
+mockAxiosOk(data, status)    response 2xx
+mockAxiosError(status, data) response 4xx/5xx
+mockAxiosTimeout()           Error con code ECONNABORTED
+mockResLike()                Express res stub (.status().json() encadenado)
+gatewayOk({...})             resultado canonico del aiGateway
+gatewayError(error)          resultado de error del aiGateway
+```
+
+Patron: la primera vez que escribis un test del framework, no lo extraigas.
+La segunda vez, si el mock se repite, moveio al fixture. La tercera vez ya
+deberia estar en `_fixtures/`.
 
 ## Definition of Done vertical
 
