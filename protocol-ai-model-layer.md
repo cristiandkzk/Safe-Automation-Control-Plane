@@ -36,15 +36,38 @@ Este protocolo responde una pregunta diferente:
 
 ## Posicion de la IA en el flujo
 
-```txt
-Policy Engine
-  → Decision Cache               ¿ya se calculo este contexto?
-  → [Provider Selector]          elige modelo segun feature, riesgo y plan
-  → [AI Router]                  llama al LLM
-  → Schema Validator             rechaza output malformado
-  → Business Validator           re-valida con output de IA
-  → ApprovalRequest
-  → RouterDecision (routable)
+```mermaid
+flowchart TD
+    PC[Policy Engine] -->|blocked| BL([block])
+    PC -->|allowed| DC{Decision Cache}
+
+    DC -->|hit| RD([RouterDecision\ncacheHit = true])
+    DC -->|miss| PS[Provider Selector\nfeature · riesgo · plan · circuit breaker]
+
+    PS -->|sin candidatos| FB([ruleOnlyFallback\nfallbackUsed = true])
+    PS -->|provider ok| UL[AI Usage Ledger\nreserva tokens preventiva]
+
+    UL --> AR[AI Router\nllama al LLM\ntemperature baja para decisiones factuales]
+
+    AR -->|error / timeout| FB
+    AR -->|rawOutput + usage| REG[AI Usage Ledger\nfinaliza con tokens reales]
+
+    REG --> SV[Schema Validator\nadditionalProperties: false]
+
+    SV -->|invalido — retry x1| AR
+    SV -->|invalido x2| FB
+    SV -->|validatedOutput| BV[Business Validator]
+
+    BV -->|falla| BL2([block])
+    BV -->|ok| OUT([RouterDecision\nroutable])
+
+    FB --> BV
+
+    style BL fill:#ef4444,color:#fff
+    style BL2 fill:#ef4444,color:#fff
+    style FB fill:#f97316,color:#fff
+    style RD fill:#22c55e,color:#fff
+    style OUT fill:#22c55e,color:#fff
 ```
 
 La IA opera entre el Decision Cache y el Schema Validator.
