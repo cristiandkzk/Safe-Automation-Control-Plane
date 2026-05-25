@@ -28,118 +28,99 @@ El gateway outbound controla las llamadas al mundo externo.
 
 ## Flujo completo
 
-```txt
-                    ENTRADA (webhooks entrantes)
-                    ─────────────────────────────
-  Provider externo
-    │
-    ▼
-  POST /webhooks/:slug
-    │
-    ▼
-  webhookGateway
-    ├─ valida firma (HMAC / IP allowlist)
-    ├─ deduplica por (provider, externalEventId)
-    ├─ persiste RawProviderEvent (pending)
-    └─ responde 200 en < 500ms
-    │
-    ▼
-  worker async
-    │
-    ▼ re-fetch del recurso via providerHttpGateway
-    │
-    └──────────────────────────────────────────────────┐
-                                                       │
-                    DECISIÓN Y SALIDA                  │
-                    ──────────────────                 │
-  Solicitud de accion                                  │
-    (usuario · bot · asistente IA · worker · webhook) ◄┘
-    │
-    ▼
-  Context Builder → RoutingSnapshot (action.type declarado)
-    │
-    ▼
-┌───────────────────────────────────────────────────────────────┐
-│  AI Routing Decision Engine          [protocol-decision-engine]│
-│                                                               │
-│  Policy Engine                                                │
-│    ├─ plan · saldo · permisos · canal · opt-out · flags       │
-│    └─ BLOCK ──────────────────────────────────────────────►   │
-│    │ pasa                                                      │
-│    ▼                                                          │
-│  Decision Cache                                               │
-│    ├─ hit  ──────────────────────────── RouterDecision ────►  │
-│    └─ miss                                                    │
-│    │                                                          │
-│    ▼                                                          │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │  AI Model Layer               [protocol-ai-model-layer] │  │
-│  │                                                         │  │
-│  │  Provider Selector                                      │  │
-│  │    └─ elige modelo por feature · riesgo · plan · breaker│  │
-│  │         │ sin candidatos → ruleOnlyFallback             │  │
-│  │         ▼                                               │  │
-│  │  AI Router (LLM call)                                   │  │
-│  │    └─ rawOutput + tokensInput + tokensOutput            │  │
-│  │         │ timeout / error → ruleOnlyFallback            │  │
-│  │         ▼                                               │  │
-│  │  Schema Validator (additionalProperties: false)         │  │
-│  │    ├─ invalido → retry x1 → invalido → ruleOnlyFallback │  │
-│  │    └─ valido → validatedOutput                          │  │
-│  │         │                                               │  │
-│  │  AI Usage Ledger (registra tokens reales)               │  │
-│  └─────────────────────────────┬───────────────────────────┘  │
-│                                │                              │
-│  Business Validator                                           │
-│    ├─ re-valida plan · saldo · permisos · canal · opt-out     │
-│    └─ BLOCK (aunque IA diga allow) ───────────────────────►   │
-│    │ pasa                                                      │
-│    ▼                                                          │
-│  ApprovalRequest (si requiresApproval = true)                 │
-│    │                                                          │
-│    ▼                                                          │
-│  RouterDecision (routable) — auditada, con expiresAt          │
-└────────────────────────────────┬──────────────────────────────┘
-                                 │
-                                 ▼
-                             Executor
-                    (no ejecuta sin decision vigente)
-                                 │
-                                 ▼
-┌───────────────────────────────────────────────────────────────┐
-│  Provider Outbound Gateway      [protocol-provider-gateway]   │
-│                                                               │
-│  Provider Registry + manifest                                 │
-│    │                                                          │
-│    ▼                                                          │
-│  getValidToken                                                │
-│    ├─ token vivo → usar                                       │
-│    ├─ vencido → refresher OAuth (lease si token single-use)   │
-│    └─ sin token → token_unavailable                           │
-│    │                                                          │
-│    ▼                                                          │
-│  Idempotencia (provider, idempotencyKey)                      │
-│    └─ hit → devuelve resultado persistido sin llamar          │
-│    │                                                          │
-│    ▼                                                          │
-│  Circuit Breaker (provider, endpoint)                         │
-│    └─ open → circuit_open sin llamar al provider              │
-│    │                                                          │
-│    ▼                                                          │
-│  Rate Limit (clientId, provider)                              │
-│    └─ excedido → rate_limited sin llamar al provider          │
-│    │                                                          │
-│    ▼                                                          │
-│  HTTP call con retry/backoff (según manifest.retryPolicy)     │
-│    ├─ 2xx        → success                                    │
-│    ├─ 408/429/5xx → backoff + reintentar                      │
-│    └─ 4xx perm.  → no reintentar                              │
-│    │                                                          │
-│  ProviderHttpAttempt (audit) + ApiCostLedger (si aplica)      │
-└────────────────────────────────┬──────────────────────────────┘
-                                 │
-                                 ▼
-                           API externa
+### Decision Engine + AI Model Layer
+
+```mermaid
+flowchart TD
+    A([Solicitud\nusuario · bot · asistente · worker · webhook]) --> B[Context Builder\nRoutingSnapshot con action.type]
+    B --> C[Policy Engine\nplan · saldo · permisos · canal · opt-out · flags]
+
+    C -->|blocked| Z1([block])
+    C -->|allowed| D{Decision Cache}
+
+    D -->|hit| E[Persistir cache hit\nen RouterDecision]
+    E --> OUT
+
+    D -->|miss| F[Provider Selector\nelige modelo por feature\ncosto · riesgo · plan · circuit breaker]
+
+    F -->|sin candidatos| FB([ruleOnlyFallback])
+    F -->|provider ok| G[AI Router\nllama al LLM]
+
+    G -->|error / timeout| FB
+    FB --> BV
+
+    G -->|rawOutput| H[Schema Validator\nadditionalProperties: false]
+
+    H -->|invalido — retry x1| G
+    H -->|invalido x2| FB
+    H -->|valido| IL[AI Usage Ledger\nregistra tokens reales]
+
+    IL --> BV[Business Validator\nre-valida plan · saldo · permisos\ncanal · opt-out · expiracion]
+
+    BV -->|falla regla dura| Z2([block])
+    BV -->|requiresApproval| J[Approval Workflow]
+    BV -->|ok| K[RouterDecision\nroutable · auditada · con expiresAt]
+
+    J -->|aprobado| K
+    J -->|rechazado| Z3([block])
+
+    K --> L[EventOutbox\nauditoria atomica]
+    L --> OUT([Executor\nsolo corre decisiones vigentes])
+
+    style Z1 fill:#ef4444,color:#fff
+    style Z2 fill:#ef4444,color:#fff
+    style Z3 fill:#ef4444,color:#fff
+    style FB fill:#f97316,color:#fff
+    style K fill:#22c55e,color:#fff
+    style OUT fill:#22c55e,color:#fff
+```
+
+### Provider Outbound Gateway
+
+```mermaid
+flowchart TD
+    EX([Executor]) --> MF[Provider Registry\nresuelve manifest]
+    MF --> GT[getValidToken]
+
+    GT -->|token vivo| ID
+    GT -->|vencido| RF[OAuth Refresher\nlease si token single-use]
+    RF -->|ok| ID[Idempotencia\nprovider · idempotencyKey]
+    RF -->|falla| TU([token_unavailable])
+
+    ID -->|hit — ya ejecutado| RES([devuelve resultado\npersistido])
+    ID -->|miss| CB[Circuit Breaker\npor provider · endpoint]
+
+    CB -->|open| CO([circuit_open])
+    CB -->|closed| RL[Rate Limit\npor clientId · provider]
+
+    RL -->|excedido| RA([rate_limited])
+    RL -->|ok| HTTP[HTTP call\ncon retry y backoff]
+
+    HTTP -->|2xx| OK[ProviderHttpAttempt success\nApiCostLedger si aplica]
+    HTTP -->|408 · 429 · 5xx| RT[backoff + reintentar\nhasta maxAttempts]
+    HTTP -->|4xx permanente| ERR[ProviderHttpAttempt error\nno reintentar]
+    RT --> HTTP
+
+    OK --> API([API externa · respuesta])
+
+    style TU fill:#ef4444,color:#fff
+    style CO fill:#ef4444,color:#fff
+    style RA fill:#ef4444,color:#fff
+    style ERR fill:#ef4444,color:#fff
+    style RES fill:#22c55e,color:#fff
+    style API fill:#22c55e,color:#fff
+```
+
+### Webhooks entrantes
+
+```mermaid
+flowchart LR
+    P([Provider externo]) --> W[POST /webhooks/:slug]
+    W --> GW[webhookGateway\nvalida firma · deduplica\npersiste RawProviderEvent]
+    GW -->|200 en menos de 500ms| P
+    GW --> WK[worker async\nre-fetch via providerHttpGateway]
+    WK --> CB[Context Builder\nRoutingSnapshot]
+    CB --> DE([Decision Engine\nflujo completo])
 ```
 
 El **Decision Engine** decide qué está permitido.
