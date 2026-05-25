@@ -121,6 +121,21 @@ flowchart TD
 
 Patron para tomar decisiones con IA sin dejar que la IA tenga la ultima palabra.
 
+El input universal es un `RoutingSnapshot` con un sub-objeto `action.type` que
+identifica que tipo de decision se pide:
+
+```txt
+campaign_send      — envio masivo de campaña
+inbound_reply      — respuesta a un mensaje/evento entrante
+content_publish    — publicar producto o post en canal externo
+auto_reply         — respuesta automatica del bot
+comment_moderate   — moderar o responder comentario publico
+```
+
+El `action.type` determina el scope de policy a evaluar, el modelo de IA a
+seleccionar y las validaciones de negocio que aplican. Agregar un tipo de
+accion nuevo = agregar un scope de policy y un feature en el selector.
+
 Responsabilidades:
 
 - ejecutar reglas duras antes de llamar al modelo;
@@ -261,14 +276,24 @@ src/
         channelBalance.policy
         planLimits.policy
         riskGates.policy
+      ← scopes separados por action.type:
+          router_ai.routing          (campaign_send)
+          router_ai.inbound_reply    (DM, mensaje entrante)
+          router_ai.comment_moderate (comentario publico)
+          router_ai.auto_reply       (automatizacion)
 
   routing/
-    CampaignRoutingSnapshot
-    campaignRouting.service
+    RoutingSnapshot             ← contrato universal con action.type
     adapters/
-      MetaChannelSnapshot
-      InstagramChannelSnapshot
+      MetaChannelSnapshot       ← canal → snapshot
+      InstagramChannelSnapshot  ← canal → snapshot
       MercadoLibreChannelSnapshot
+      InstagramEventSnapshot    ← evento inbound → RoutingSnapshot completo
+
+  campaigns/
+    routing/
+      CampaignRoutingSnapshot   ← wrapper de RoutingSnapshot para campaign_send
+      campaignRouting.service
 
   providers/
     registry/
