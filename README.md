@@ -26,42 +26,125 @@ El gateway outbound controla las llamadas al mundo externo.
 
 ---
 
-## Como se relacionan
+## Flujo completo
 
 ```txt
-Solicitud de accion
-  (usuario, bot, asistente IA interno, worker o webhook)
-  │
-  ▼
-Context Builder — arma RoutingSnapshot con action.type
-  │
-  ▼
-┌─────────────────────────────────────────────────────────────┐
-│  AI Routing Decision Engine                                 │
-│                                                             │
-│  Policy Engine → Decision Cache → [AI Model Layer]         │
-│    → Schema Validator → Business Validator                  │
-│    → ApprovalRequest → RouterDecision (routable)           │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-                      Executor
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Provider Outbound Gateway                                  │
-│                                                             │
-│  Token refresh → Idempotencia → Circuit breaker            │
-│    → Rate limit → Retry/backoff → ProviderHttpAttempt      │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-                    API externa
+                    ENTRADA (webhooks entrantes)
+                    ─────────────────────────────
+  Provider externo
+    │
+    ▼
+  POST /webhooks/:slug
+    │
+    ▼
+  webhookGateway
+    ├─ valida firma (HMAC / IP allowlist)
+    ├─ deduplica por (provider, externalEventId)
+    ├─ persiste RawProviderEvent (pending)
+    └─ responde 200 en < 500ms
+    │
+    ▼
+  worker async
+    │
+    ▼ re-fetch del recurso via providerHttpGateway
+    │
+    └──────────────────────────────────────────────────┐
+                                                       │
+                    DECISIÓN Y SALIDA                  │
+                    ──────────────────                 │
+  Solicitud de accion                                  │
+    (usuario · bot · asistente IA · worker · webhook) ◄┘
+    │
+    ▼
+  Context Builder → RoutingSnapshot (action.type declarado)
+    │
+    ▼
+┌───────────────────────────────────────────────────────────────┐
+│  AI Routing Decision Engine          [protocol-decision-engine]│
+│                                                               │
+│  Policy Engine                                                │
+│    ├─ plan · saldo · permisos · canal · opt-out · flags       │
+│    └─ BLOCK ──────────────────────────────────────────────►   │
+│    │ pasa                                                      │
+│    ▼                                                          │
+│  Decision Cache                                               │
+│    ├─ hit  ──────────────────────────── RouterDecision ────►  │
+│    └─ miss                                                    │
+│    │                                                          │
+│    ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  AI Model Layer               [protocol-ai-model-layer] │  │
+│  │                                                         │  │
+│  │  Provider Selector                                      │  │
+│  │    └─ elige modelo por feature · riesgo · plan · breaker│  │
+│  │         │ sin candidatos → ruleOnlyFallback             │  │
+│  │         ▼                                               │  │
+│  │  AI Router (LLM call)                                   │  │
+│  │    └─ rawOutput + tokensInput + tokensOutput            │  │
+│  │         │ timeout / error → ruleOnlyFallback            │  │
+│  │         ▼                                               │  │
+│  │  Schema Validator (additionalProperties: false)         │  │
+│  │    ├─ invalido → retry x1 → invalido → ruleOnlyFallback │  │
+│  │    └─ valido → validatedOutput                          │  │
+│  │         │                                               │  │
+│  │  AI Usage Ledger (registra tokens reales)               │  │
+│  └─────────────────────────────┬───────────────────────────┘  │
+│                                │                              │
+│  Business Validator                                           │
+│    ├─ re-valida plan · saldo · permisos · canal · opt-out     │
+│    └─ BLOCK (aunque IA diga allow) ───────────────────────►   │
+│    │ pasa                                                      │
+│    ▼                                                          │
+│  ApprovalRequest (si requiresApproval = true)                 │
+│    │                                                          │
+│    ▼                                                          │
+│  RouterDecision (routable) — auditada, con expiresAt          │
+└────────────────────────────────┬──────────────────────────────┘
+                                 │
+                                 ▼
+                             Executor
+                    (no ejecuta sin decision vigente)
+                                 │
+                                 ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Provider Outbound Gateway      [protocol-provider-gateway]   │
+│                                                               │
+│  Provider Registry + manifest                                 │
+│    │                                                          │
+│    ▼                                                          │
+│  getValidToken                                                │
+│    ├─ token vivo → usar                                       │
+│    ├─ vencido → refresher OAuth (lease si token single-use)   │
+│    └─ sin token → token_unavailable                           │
+│    │                                                          │
+│    ▼                                                          │
+│  Idempotencia (provider, idempotencyKey)                      │
+│    └─ hit → devuelve resultado persistido sin llamar          │
+│    │                                                          │
+│    ▼                                                          │
+│  Circuit Breaker (provider, endpoint)                         │
+│    └─ open → circuit_open sin llamar al provider              │
+│    │                                                          │
+│    ▼                                                          │
+│  Rate Limit (clientId, provider)                              │
+│    └─ excedido → rate_limited sin llamar al provider          │
+│    │                                                          │
+│    ▼                                                          │
+│  HTTP call con retry/backoff (según manifest.retryPolicy)     │
+│    ├─ 2xx        → success                                    │
+│    ├─ 408/429/5xx → backoff + reintentar                      │
+│    └─ 4xx perm.  → no reintentar                              │
+│    │                                                          │
+│  ProviderHttpAttempt (audit) + ApiCostLedger (si aplica)      │
+└────────────────────────────────┬──────────────────────────────┘
+                                 │
+                                 ▼
+                           API externa
 ```
 
 El **Decision Engine** decide qué está permitido.
-El **AI Model Layer** es quien razona — dentro del slot que el Decision Engine le asigna.
-El **Provider Gateway** ejecuta la llamada al mundo externo.
+El **AI Model Layer** razona dentro del slot que el Decision Engine le asigna — nunca toca APIs externas.
+El **Provider Gateway** ejecuta la llamada al mundo externo con control total.
 El protocolo de **API Integration** explica cómo conectar una nueva API a esta cadena.
 
 ---
