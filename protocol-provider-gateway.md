@@ -274,12 +274,51 @@ Si falla, marcar cuenta token_expired
 Si el provider rota refreshToken (MELI), usar lease en metadata para evitar refresh concurrente
 ```
 
-Lease para tokens single-use (ej: MercadoLibre):
+### Lease anti-concurrente para refresh
+
+Sin lease, dos workers que detectan token vencido en paralelo llaman al
+refresher al mismo tiempo. Para providers que rotan refreshToken (OAuth
+standard como MercadoLibre), el segundo refresh recibe un refreshToken
+que el primero ya consumio → la cuenta queda con tokens invalidos.
+
+Patron canonico (campos en ProviderAccount):
 
 ```txt
-metadata.refreshLockedUntil = now + 30s antes del call HTTP
-finally: unset refreshLockedUntil
-Si refreshLockedUntil > now → throw 'refresh locked, otro worker esta refrescando'
+refreshLockedBy       string|null    (workerId que tomo el lease)
+refreshLockedAt       Date|null
+refreshLockExpiresAt  Date|null      (TTL ~30s, cubre worker caido)
+```
+
+Flujo:
+
+```txt
+worker A intenta claim atomico:
+  findOneAndUpdate(
+    { _id, $or: [
+        { refreshLockedBy: null },
+        { refreshLockExpiresAt: { $lt: now } }   // recovery de lease zombie
+    ]},
+    { $set: { refreshLockedBy: workerId, ..., refreshLockExpiresAt: now+30s } }
+  )
+
+A gana (truthy):
+  -> llama refresher, persiste tokens, libera lease (siempre, try/finally)
+
+A pierde (null):
+  -> pollea cada ~250ms hasta deadline (TTL + margen)
+  -> cuando el lease se libera o expira, re-lee tokens desde BD
+  -> NO llama al refresher; el otro worker ya lo hizo
+```
+
+Reglas:
+
+```txt
+El refresher provider-specific NO se preocupa por concurrencia — el lease
+  del wrapper (getValidToken) garantiza single-shot.
+
+El lease tiene TTL (recovery automatico si el worker se cae mid-refresh).
+
+Liberar siempre, incluso si el refresh fallo (try/finally en el wrapper).
 ```
 
 ---
@@ -412,6 +451,8 @@ Tercer corte:
 
 ## Tests — casos minimos
 
+### Gateway HTTP
+
 ```txt
 Token vigente:            no llama refresher, llama provider
 Token vencido + refresher: llama refresher, persiste token nuevo, llama provider
@@ -425,6 +466,32 @@ Rate limit excedido:      devuelve rate_limited, no llama provider
 Timeout:                  reintenta, si agota devuelve timeout
 Response grande:          persiste snapshot truncado, sin tokens
 Costo variable:           crea ApiCostLedger vinculado al attempt
+```
+
+### Lease de refresh anti-concurrente
+
+```txt
+2 workers concurrentes con token vencido
+  -> exactamente 1 llamada al refresher
+  -> uno gana { refreshed: true }, el otro lee desde BD { refreshed: false }
+
+Lease vencido (worker zombie):
+  -> nuevo worker reclama el lock (filtro $or:[{lockedBy:null}, {lockExpiresAt:<now}])
+
+Refresh exitoso → lease liberado (updateOne con refreshLockedBy: null)
+Refresh falla   → lease liberado igual (try/finally, no queda lock huerfano)
+```
+
+### Helpers de tests centralizados
+
+Despues de escribir 3+ archivos de test del framework, los mocks se repiten.
+Centralizar en `tests/_fixtures/providers.js` (prefijo `_` para excluir del
+testMatch) baja ~30% de codigo:
+
+```txt
+IDS, makeProviderAccount, makeManifest, callParams
+mockGetValidToken, mockAxiosOk, mockAxiosError, mockAxiosTimeout
+mockResLike (Express res stub encadenable)
 ```
 
 ---
@@ -459,6 +526,55 @@ desde el manifest.
 
 Si un endpoint falla y se corta todo el provider, se pierde capacidad
 innecesariamente. Scope: `(provider, endpoint)`.
+
+---
+
+## Admin / ROOT — panel de troubleshooting
+
+Endpoints minimos para que el rol ROOT inspeccione el framework sin tocar
+la BD directamente:
+
+```txt
+GET  /admin/providers/capabilities         manifests registrados
+GET  /admin/providers/accounts             ProviderAccount con status/expiresAt/lastError
+GET  /admin/providers/http-attempts        ProviderHttpAttempt con filtros
+GET  /admin/providers/http-attempts/:id    detalle con responseSnapshot sanitizado
+GET  /admin/providers/raw-events           RawProviderEvent recientes
+GET  /admin/providers/raw-events/:id       detalle con payload + headers sanitizados
+POST /admin/providers/raw-events/:id/retry recovery de eventos dead-lettered
+GET  /admin/providers/sync-state           cursores de backfill por provider
+```
+
+### Retry de eventos dead-lettered
+
+El endpoint `POST /raw-events/:id/retry` permite resucitar un evento que
+agoto sus reintentos sin acceso directo a la BD.
+
+```txt
+Estados retryables:    dead_lettered, failed
+Estados no retryables: pending, processing, processed, duplicate, rejected
+                       (devuelven 409 invalid_status)
+
+Al resetear:
+  status      -> pending
+  attempts    -> 0
+  error       -> null
+  processedAt -> null
+
+El worker async lo agarra en el proximo poll. No re-encola FIFO.
+```
+
+### UI recomendada
+
+Una sola pagina con tabs internos es mas operativa que multiples paginas:
+
+```txt
+/admin/providers (4 tabs)
+  Cuentas             ProviderAccount + filtros + indicador de expiracion proxima
+  Llamadas HTTP       ProviderHttpAttempt + modal con detalle/responseSnapshot
+  Webhooks recibidos  RawProviderEvent + boton "Reintentar" en dead_lettered/failed
+  Providers reg.      Cards con manifests (capabilities, costo variable, etc.)
+```
 
 ---
 

@@ -185,34 +185,37 @@ module.exports = async function refresh({ refreshToken }) {
 };
 ```
 
-**Para providers con refresh_token single-use** (ej: MercadoLibre): usar lease
-para evitar refresh concurrente. Si dos workers refrescan simultaneamente se
-invalida la sesion.
+**Concurrencia: ya esta resuelta en el wrapper `getValidToken`**.
+
+`providerAccount.getValidToken` aplica un lease distribuido (campos
+`refreshLockedBy` + `refreshLockExpiresAt` en `ProviderAccount`, TTL ~30s)
+ANTES de invocar al refresher. Tu refresher se llama single-shot, no
+necesita preocuparse por la carrera.
+
+Si dos workers detectan token vencido al mismo tiempo, solo uno entra al
+refresher; el otro pollea y re-lee tokens frescos desde BD. Ver el
+`protocol-provider-gateway.md` §"Lease anti-concurrente para refresh"
+para el patron completo.
+
+**Rotacion de refreshToken**: si el provider rota (MercadoLibre, OAuth
+standard), devolve siempre el `refresh_token` del response. Si no llega,
+lanza error ruidoso — la cuenta queda en estado peligroso si el provider
+espera rotacion y no la haces.
+
+**Sin rotacion** (Meta long-lived tokens, fb_exchange_token): devolve el
+nuevo accessToken tambien como `refreshToken` para que el siguiente
+refresh lo use:
 
 ```js
-module.exports = async function refresh({ account, providerAccountModel }) {
-  const now = new Date();
-  if (account.metadata?.refreshLockedUntil && new Date(account.metadata.refreshLockedUntil) > now) {
-    throw new Error('refresh locked — otro worker esta refrescando');
-  }
-
-  // Reservar lease antes del POST
-  await providerAccountModel.updateOne(
-    { _id: account._id },
-    { $set: { 'metadata.refreshLockedUntil': new Date(Date.now() + 30_000) } },
-  );
-
-  try {
-    const { data } = await axios.post('https://api.example.com/oauth/token', { /* ... */ });
-    return { accessToken: data.access_token, refreshToken: data.refresh_token, expiresInSec: data.expires_in };
-  } finally {
-    await providerAccountModel.updateOne({ _id: account._id }, { $unset: { 'metadata.refreshLockedUntil': '' } });
-  }
+return {
+  accessToken:  data.access_token,
+  refreshToken: data.access_token,   // sin rotacion: re-uso del access
+  expiresInSec: data.expires_in,
 };
 ```
 
-Si la API usa API key estatica, omitir este paso — `getValidToken` devuelve el
-token guardado directamente.
+Si la API usa API key estatica, omitir este paso — `getValidToken` devuelve
+el token guardado directamente.
 
 ---
 
@@ -585,7 +588,7 @@ Un canal no esta completo hasta que cumple:
 
 - [ ] Manifest en `providers/registry/manifests/` registrado en `index.js`
 - [ ] Usa `ProviderAccount` para cuentas/tokens/status
-- [ ] Si usa OAuth, tiene refresher con lease si el provider rota tokens
+- [ ] Si usa OAuth, tiene refresher (la concurrencia la maneja el lease de `getValidToken`)
 - [ ] Webhooks entran por `webhookGateway` + persisten en `RawProviderEvent`
 - [ ] Worker procesa `RawProviderEvent` de forma idempotente
 - [ ] Worker hace re-fetch del resource, no confía solo en el payload
@@ -607,7 +610,7 @@ Un canal no esta completo hasta que cumple:
 [ ] Manifest registrado en index.js
 [ ] ProviderAccount guarda tokens cifrados
 [ ] OAuth callback funciona en sandbox con cuenta real
-[ ] Refresh de tokens funciona (con lease si rota)
+[ ] Refresh de tokens single-shot bajo concurrencia (lease del wrapper)
 [ ] Webhook responde 200 en < 5s (< 500ms para MELI)
 [ ] Webhook deduplica por externalEventId
 [ ] Worker re-fetch usa providerHttpGateway, no axios directo
@@ -647,6 +650,53 @@ debe pasar por providerHttpGateway.
 ```
 
 ---
+
+## Panel ROOT — troubleshooting durante implementacion
+
+Mientras implementas una API nueva, el panel ROOT en `/admin/providers`
+es la herramienta principal de debugging. Sin necesidad de leer logs ni
+tocar la BD, podes ver:
+
+```txt
+Cuentas             ProviderAccount con status, expiresAt, lastError.
+                    Detectas tokens vencidos antes de que el flujo falle.
+
+Llamadas HTTP       ProviderHttpAttempt con filtros por provider/clientId/status.
+                    Modal con responseSnapshot, attempts, latencyMs, errorCode.
+
+Webhooks recibidos  RawProviderEvent con boton "Reintentar" en eventos
+                    dead_lettered/failed. Recovery operativa sin acceso a BD.
+
+Providers reg.      Cards con manifests (capabilities, webhooks, costo).
+```
+
+Endpoint del retry: `POST /admin/providers/raw-events/:id/retry`.
+Acepta solo estados retryables (`dead_lettered`, `failed`); el resto
+devuelve 409 `invalid_status`.
+
+Ver el protocolo de Provider Outbound Gateway §"Admin / ROOT" para el
+listado completo de endpoints sugeridos.
+
+## Helpers de tests reusables
+
+Despues de escribir 3+ archivos de test del framework, los mocks se repiten.
+Centralizar fixtures en `tests/_fixtures/providers.js` (prefijo `_` para
+excluir del testMatch del runner) reduce ~30% del codigo de cada test:
+
+```txt
+IDS                          ObjectIds canonicos
+makeProviderAccount({...})   stub completo con .save() y campos de lease
+makeManifest({...})          manifest con retry corto (10/20/30ms) para tests rapidos
+callParams({...})            params canonicos para providerHttpGateway.call()
+mockGetValidToken({...})     shape estandar { accessToken, account, refreshed }
+mockAxiosOk(data, status)    response 2xx
+mockAxiosError(status, data) response 4xx/5xx
+mockAxiosTimeout()           Error con code ECONNABORTED
+mockResLike()                Express res stub encadenable
+```
+
+Patron: la primera vez que escribis un mock, no lo extraigas. La segunda
+vez que se repite, moveio al fixture. La tercera vez ya deberia estar ahi.
 
 ## Lo que NO hay que hacer
 

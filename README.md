@@ -24,6 +24,12 @@ El gateway outbound controla las llamadas al mundo externo.
 | **Provider Outbound Gateway** | Ejecuta llamadas a APIs externas de forma idempotente, limitada y auditable | [protocolo →](./protocol-provider-gateway.md) |
 | **API Integration** | Receta paso a paso para agregar una nueva API externa al control plane | [protocolo →](./protocol-api-integration.md) |
 
+Ejemplo concreto que aplica los 4 protocolos end-to-end:
+
+- [Vertical Flow Example](./example-vertical-flow.md) — flujo vertical completo
+  desde webhook/UI/asistente hasta llamada externa, con 4 casos reales
+  (Instagram DM, marketplace question, asistente proponiendo, campaña Meta).
+
 ---
 
 ## Flujo completo
@@ -83,7 +89,7 @@ flowchart TD
     MF --> GT[getValidToken]
 
     GT -->|token vivo| ID
-    GT -->|vencido| RF[OAuth Refresher\nlease si token single-use]
+    GT -->|vencido + lease ganado| RF[OAuth Refresher\nsingle-shot]
     RF -->|ok| ID[Idempotencia\nprovider · idempotencyKey]
     RF -->|falla| TU([token_unavailable])
 
@@ -176,7 +182,7 @@ Resultado: la IA recomienda, pero las reglas y validadores siguen teniendo la ul
 
 ### Tercer corte — llamadas externas controladas
 
-- Token refresh provider-specific con lease si el provider rota tokens.
+- Token refresh provider-specific (wrapper aplica lease anti-concurrente con TTL).
 - Rate limits por tenant/provider.
 - Circuit breakers.
 - Cost ledger externo.
