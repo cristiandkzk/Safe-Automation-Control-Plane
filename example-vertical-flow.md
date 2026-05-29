@@ -20,6 +20,15 @@ Ejecucion controlada.
 Auditoria completa.
 ```
 
+Para acciones sensibles:
+
+```txt
+El asistente propone.
+La aplicacion valida.
+El usuario aprueba.
+El sistema ejecuta.
+```
+
 ## Vista vertical
 
 ```txt
@@ -189,7 +198,9 @@ Instagram event         -> InstagramEvent
 MercadoLibre question   -> MarketplaceQuestion
 MercadoLibre publish    -> MarketplaceListing
 Campaign request        -> RoutingSnapshot (forCampaignSend)
+Social post submit      -> RoutingSnapshot (forContentPublish)
 Asistente propone       -> RoutingSnapshot (forInboundReply / forContentPublish)
+Asistente accion critica -> RoutingSnapshot (forInboundReply + executionPayload)
 Intake financiero       -> FinanceIntake
 ```
 
@@ -382,9 +393,12 @@ Casos tipicos:
 responder pregunta de marketplace
 publicar producto
 contestar comentario sensible
+moderar comentario publico
+publicar post/reel/story
 enviar campania masiva
-publicar post/reel
 usar canal experimental
+crear una reserva o turno
+ejecutar accion destructiva de CRM/campanias
 ```
 
 Regla:
@@ -410,6 +424,7 @@ Piezas:
 
 ```txt
 Executor / worker
+approval executor registry
 Provider Outbound Gateway
 providerAccount.getValidToken
 providerRateLimit
@@ -497,22 +512,23 @@ El gateway no debe romper el flujo con excepciones del provider.
 1. Usuario envia DM en Instagram.
 2. Meta manda webhook al endpoint del provider.
 3. webhookGateway valida firma y persiste RawProviderEvent.
-4. Worker procesa RawProviderEvent.
-5. Se crea InstagramEvent kind=direct_message.
-6. Se resuelve ProviderAccount meta_instagram.
-7. Context Builder crea RoutingSnapshot action.type=inbound_reply.
-8. Policy Engine valida permisos, ventana, opt-out, plan y estado del canal.
-9. Decision Engine genera o evita draft.
-10. Business Validator decide needs_approval.
-11. Se crea ApprovalRequest.
-12. Humano aprueba o edita respuesta.
-13. Executor carga RouterDecision vigente.
-14. instagram.send-worker llama providerHttpGateway.call().
-15. Gateway refresca token si hace falta.
-16. Gateway usa idempotencyKey ig_reply_<eventId>_<version>.
-17. Meta Graph recibe la respuesta.
-18. Se guarda ProviderHttpAttempt, providerMessageId y AuditLog.
-19. UI muestra estado publicado.
+4. Worker reclama el RawProviderEvent pending.
+5. Inbound service normaliza el payload y re-fetch si el evento viene parcial.
+6. Se crea InstagramEvent kind=direct_message.
+7. El service de dominio genera draft con aiGateway si corresponde.
+8. Context Builder crea RoutingSnapshot action.type=inbound_reply.
+9. Policy Engine valida permisos, ventana, plan y estado del canal.
+10. Decision Engine persiste RouterDecision.
+11. Business Validator decide si requiere approval.
+12. Se crea ApprovalRequest sourceModule=instagram, sourceType=<kind>_reply.
+13. Humano aprueba o edita respuesta.
+14. approval.service dispara el executor registrado para instagram/<kind>_reply.
+15. El executor re-lee InstagramEvent y ProviderAccount.
+16. Outbound service llama providerHttpGateway.call().
+17. Gateway refresca token si hace falta, aplica idempotencia y registra ProviderHttpAttempt.
+18. Idempotency key sugerida: ig_dm_<approvalId|eventId>_v<version>.
+19. Meta Graph recibe la respuesta.
+20. InstagramEvent queda answered/failed y UI muestra estado.
 ```
 
 ## Ejemplo vertical 2: Pregunta de marketplace
@@ -530,8 +546,8 @@ El gateway no debe romper el flujo con excepciones del provider.
 10. Se crea ApprovalRequest.
 11. Usuario aprueba desde UI o WhatsApp.
 12. Executor publica respuesta via providerHttpGateway.
-13. Gateway usa idempotencyKey ml_question_answer_<questionId>_<answerVersion>.
-14. Se guarda ProviderHttpAttempt y MarketplaceQuestion.status=published.
+13. Gateway usa idempotencyKey marketplace_answer_<externalQuestionId>_v<version>.
+14. Se guarda ProviderHttpAttempt y MarketplaceQuestion.status=answered.
 15. AuditLog registra quien aprobo y que se publico.
 ```
 
@@ -554,8 +570,34 @@ El gateway no debe romper el flujo con excepciones del provider.
 13. Operador aprueba en la UI de approvals.
 14. ApprovalRequest -> approved, RouterDecision -> approved -> routable.
 15. Executor consume la decision y publica via providerHttpGateway.
-16. Idempotency key: ml_question_answer_<externalQuestionId>_<answerVersion>.
-17. MarketplaceQuestion.status=published, AuditLog, ApiCostLedger si aplica.
+16. Idempotency key: marketplace_answer_<externalQuestionId>_v<version>.
+17. MarketplaceQuestion.status=answered, AuditLog, ApiCostLedger si aplica.
+```
+
+El mismo limite aplica a otras tools de escritura:
+
+```txt
+propose_social_reply(eventId, answerText)
+  -> genera draft
+  -> requestApprovalIfNeeded()
+  -> ApprovalRequest <module>/<kind>_reply
+  -> outbound executor post-approval
+
+propose_comment_moderate(eventId, action)
+  -> RoutingSnapshot action.type=comment_moderate
+  -> ApprovalRequest <module>/comment_moderate si corresponde
+  -> outbound executor post-approval
+
+propose_social_publish(postId)
+  -> socialPost.submit()
+  -> RoutingSnapshot action.type=content_publish
+  -> ApprovalRequest social/<provider>_publish si corresponde
+  -> publish worker publica via providerHttpGateway
+
+acciones destructivas del asistente
+  -> RoutingSnapshot con executionPayload
+  -> ApprovalRequest persistente
+  -> executor reproduce la tool aprobada
 ```
 
 Lo que el asistente NO hace:
@@ -565,26 +607,29 @@ ejecutar la respuesta por su cuenta
 aprobar sus propias propuestas
 saltar el Policy Engine
 llamar al marketplace directo
+publicar directo en redes sociales
+ejecutar acciones destructivas sin ApprovalRequest
 ```
 
 ## Ejemplo vertical 4: Campania WhatsApp Meta
 
 ```txt
 1. Usuario crea campania.
-2. campaignRouting.service arma RoutingSnapshot action.type=campaign_send.
-3. Cost estimator calcula estimatedCost en moneda local.
-4. Policy Engine valida plan, saldo, opt-out y canal.
-5. Decision Engine optimiza tandas/demoras si aporta valor.
-6. Business Validator exige saldo/reserva y decision vigente.
-7. Si requiere aprobacion, se crea ApprovalRequest.
-8. Scheduler encola batches.
-9. Worker ejecuta cada batch con RouterDecision vigente.
-10. Cada mensaje sale por providerHttpGateway.
-11. Gateway usa idempotencyKey meta_wa_message_<conversationId>_<messageId>.
-12. Meta Graph recibe template/message.
-13. Delivery webhook vuelve por webhookGateway.
-14. DeliveryTracker actualiza estado.
-15. ApiCostLedger y MetaCostLedger registran costo.
+2. campaign service valida template aprobado y audience elegible.
+3. Cost estimator calcula costo estimado.
+4. Context Builder arma RoutingSnapshot action.type=campaign_send.
+5. Policy Engine valida plan, saldo, opt-out y canal.
+6. Decision Engine persiste RouterDecision y reserva saldo si corresponde.
+7. Business Validator exige saldo/reserva y decision vigente.
+8. Si requiere aprobacion, el motor crea ApprovalRequest.
+9. Si queda permitido/aprobado, executor recorre destinatarios.
+10. Cada template sale por outbound service.
+11. Outbound service llama providerHttpGateway.call().
+12. Gateway usa idempotencyKey meta_wa_template_<decisionId|sourceRef>_v<version>.
+13. Meta Graph recibe template/message.
+14. Delivery webhook vuelve por webhookGateway.
+15. Inbound service reconcilia status/costo real.
+16. ProviderHttpAttempt, ApiCostLedger y ledger del provider registran trazabilidad.
 ```
 
 ## Tabla de responsabilidad
@@ -595,7 +640,7 @@ llamar al marketplace directo
 | Worker inbound | No | Normaliza | Modelos dominio | Llamar provider externo directo |
 | Policy Engine | Reglas duras | No | Policy result | Llamar IA |
 | Decision Engine | Decision validada | No | RouterDecision | Enviar/publicar |
-| ApprovalService | Gate humano | No | ApprovalRequest | Modificar provider |
+| ApprovalService | Gate humano | Dispara executor registrado | ApprovalRequest | Modificar provider directo |
 | Executor | No recalcula | Si | Resultado dominio | Ignorar decision expirada |
 | Provider Gateway | No decide negocio | Llama API externa | ProviderHttpAttempt | Saltar idempotencia |
 | Audit/Cost | No | No | AuditLog/ApiCostLedger | Contener tokens |
@@ -623,19 +668,26 @@ ocr_process_document
 
 ```txt
 Meta WhatsApp:
-  meta_wa_message_<conversationId>_<messageId>
+  meta_wa_reply_<decisionId|sourceRef>_v<version>
+  meta_wa_media_<type>_<decisionId|sourceRef>_v<version>
+  meta_wa_template_<templateName>_<decisionId|sourceRef>_v<version>
 
-Instagram reply:
-  ig_reply_<eventId>_<answerVersion>
+Instagram DM:
+  ig_dm_<approvalId|eventId>_v<version>
+
+Instagram comment reply:
+  ig_comment_reply_<approvalId|eventId>_v<version>
 
 Instagram moderation:
-  ig_comment_hide_<eventId>_<moderationVersion>
+  ig_hide_<commentId>_v1
 
 Social publish:
-  social_publish_<postId>_<version>
+  social_publish_container_<postId>_v<attempt>
+  social_publish_final_<postId>_v<attempt>
+  social_publish_permalink_<mediaId>
 
-MercadoLibre answer:
-  ml_question_answer_<externalQuestionId>_<answerVersion>
+Marketplace answer:
+  marketplace_answer_<externalQuestionId>_v<version>
 
 MercadoLibre stock:
   ml_stock_sync_<externalItemId>_<newStock>_<version>
@@ -787,6 +839,7 @@ Una feature vertical esta completa cuando:
 - [ ] Acciones sensibles pasan por `AI Routing Decision Engine`.
 - [ ] Existe `RouterDecision` persistida.
 - [ ] Aprobaciones usan `ApprovalRequest`.
+- [ ] Si la aprobacion debe ejecutar, registra executor por `sourceModule/sourceType`.
 - [ ] El executor valida decision vigente.
 - [ ] Salidas externas pasan por `providerHttpGateway`.
 - [ ] Hay idempotency key estable.
